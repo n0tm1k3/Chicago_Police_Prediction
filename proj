@@ -1,0 +1,300 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier  # (for prediction if XGBoost not preferred)
+from sklearn.metrics import classification_report, accuracy_score
+from sklearn.cluster import KMeans
+import geopandas as gpd  # For maps
+import matplotlib.pyplot as plt  # For visualization
+from shapely.geometry import Point  # for creating point geometry
+
+# Load the dataset
+df = pd.read_csv('Crime Data.csv')
+df.dropna(inplace = True)
+columns_to_remove = ['CASE#', 'BLOCK', ' IUCR', ' SECONDARY DESCRIPTION', ' LOCATION DESCRIPTION', 'ARREST', 'DOMESTIC', 'BEAT', 'WARD', 'FBI CD', 'X COORDINATE', 'Y COORDINATE', 'LOCATION']
+df.drop(columns=columns_to_remove, inplace=True)
+# Display the first few rows
+print(df.columns)
+
+# Get the top 3 frequent crimes
+
+top_3_crimes = df[' PRIMARY DESCRIPTION'].value_counts().nlargest(3).index.tolist()
+
+print("Top 3 Crimes:", top_3_crimes)
+
+crime_types = df[' PRIMARY DESCRIPTION'].unique()
+
+# Print the crime types
+print("Unique Crime Types:")
+print(crime_types)
+
+crime_to_group = {
+    "THEFT": "Patrol & Response",
+    "BATTERY": "Violent Crimes",
+    "CRIMINAL DAMAGE": "Investigations",
+    "ASSAULT": "Patrol & Response",
+    "DECEPTIVE PRACTICE": "Investigations",
+    "OTHER OFFENSE": "Patrol & Response",
+    "NARCOTICS": "Vice & Narcotics",
+    "BURGLARY": "Patrol & Response",
+    "ROBBERY": "Violent Crimes",
+    "MOTOR VEHICLE THEFT": "Patrol & Response",
+    "CRIMINAL TRESPASS": "Patrol & Response",
+    "WEAPONS VIOLATION": "Violent Crimes",
+    "OFFENSE INVOLVING CHILDREN": "Investigations",
+    "PUBLIC PEACE VIOLATION": "Patrol & Response",
+    "CRIM SEXUAL ASSAULT": "Violent Crimes",
+    "SEX OFFENSE": "Investigations",
+    "INTERFERENCE WITH PUBLIC OFFICER": "Patrol & Response",
+    "PROSTITUTION": "Vice & Narcotics",
+    "LIQUOR LAW VIOLATION": "Patrol & Response",
+    "ARSON": "Arson & Explosives",
+    "CRIMINAL SEXUAL ABUSE": "Investigations",
+    "STALKING": "Investigations",
+    "KIDNAPPING": "Violent Crimes",
+    "INTIMIDATION": "Investigations",
+    "HOMICIDE": "Violent Crimes",
+    "CONCEALED CARRY LICENSE VIOLATION": "Investigations",
+    "OBSCENITY": "Investigations",
+    "NON-CRIMINAL": "Patrol & Response",
+    "OTHER NARCOTIC VIOLATION": "Vice & Narcotics",
+    "HUMAN TRAFFICKING": "Investigations",
+    "PUBLIC INDECENCY": "Patrol & Response",
+    "GAMBLING": "Vice & Narcotics",
+    "CRIMINAL SEXUAL ASSAULT" : "Violent Crimes"
+}
+df['Police_Group'] = df[' PRIMARY DESCRIPTION'].map(crime_to_group)
+
+
+# Function to parse date with multiple formats
+def parse_date(date_str):
+    for fmt in ('%m/%d/%Y %I:%M:%S %p', '%m-%d-%Y %H:%M'):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return pd.NaT  # Return Not-a-Time if parsing fails
+
+# Apply the parsing function
+df['parsed_date'] = df['DATE  OF OCCURRENCE'].apply(parse_date)
+
+# Drop rows with unparsed dates
+df = df.dropna(subset=['parsed_date']).reset_index(drop=True)
+
+# Extract temporal features
+df['hour'] = df['parsed_date'].dt.hour
+df['day'] = df['parsed_date'].dt.day
+df['month'] = df['parsed_date'].dt.month
+df['day_of_week'] = df['parsed_date'].dt.dayofweek  # Monday=0, Sunday=6
+
+def feature_engineering(df):
+    # Time of day
+    df['time_of_day'] = pd.cut(df['hour'], bins=[0, 6, 12, 18, 24], labels=['night', 'morning', 'afternoon', 'evening'], right=False, include_lowest=True)
+    df = pd.get_dummies(df, columns=['time_of_day'], prefix='tod', drop_first=True)
+
+    df['weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+
+    us_holidays = holidays.US()
+    df['is_holiday'] = df['parsed_date'].dt.normalize().isin(us_holidays).astype(int)
+    df['day_of_year'] = df['parsed_date'].dt.dayofyear
+
+    season_map = {1: 'winter', 2: 'winter', 3: 'spring', 4: 'spring', 5: 'spring', 6: 'summer', 7: 'summer', 8: 'summer', 9: 'fall', 10: 'fall', 11: 'fall', 12: 'winter'}
+    df['season'] = df['month'].map(season_map)
+    df = pd.get_dummies(df, columns=['season'], prefix='seas', drop_first=True)
+
+    city_center = (41.8781, -87.6298)
+    o_block_coords = (41.8080, -87.6186)
+    crime_centers = {
+        "englewood": (41.779, -87.641), "west_garfield_park": (41.880, -87.726),
+        "austin": (41.895, -87.772), "humboldt_park": (41.903, -87.701),
+    }
+
+    # Vectorized distance calculations (much faster and handles single rows)
+    coords = df[['LATITUDE', 'LONGITUDE']].values
+    df['distance_to_center'] = [geodesic(coord, city_center).km for coord in coords]
+    df['distance_to_oblock'] = [geodesic(coord, o_block_coords).km for coord in coords]
+    for name, center in crime_centers.items():
+        df[f'distance_to_{name}'] = [geodesic(coord, center).km for coord in coords]
+
+    return df
+
+df= feature_engineering(df)
+
+df.columns
+
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(df['Police_Group'])
+
+features = ['hour', 'day', 'month_sin', 'month_cos', 'day_of_week', 'LATITUDE', 'LONGITUDE', 'weekend',
+            'tod_morning','tod_afternoon','tod_evening', 'is_holiday', 'day_of_year',
+            'seas_spring', 'seas_summer', 'seas_winter', 'distance_to_center', 'distance_to_oblock',
+            'distance_to_englewood', 'distance_to_west_garfield_park', 'distance_to_austin', 'distance_to_humboldt_park']
+
+interaction_features = []
+features_to_iterate = features[:]
+for feature1, feature2 in zip(features_to_iterate[:-1], features_to_iterate[1:]):
+    interaction_name = f"{feature1}_{feature2}"
+    interaction_features.append(interaction_name)
+    df[interaction_name] = df[feature1] * df[feature2]
+
+X = df[features + [col for col in df.columns if col.startswith('location_')] + interaction_features].values
+
+#Split the data FIRST
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+#
+# THEN apply SMOTE only to the training data
+smote = SMOTE(random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+# Scale AFTER SMOTE and splitting
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_res)
+X_test_scaled = scaler.transform(X_test) # Use the same scaler fitted on the training data
+
+# Calculate class weights AFTER SMOTE
+class_weights = compute_class_weight('balanced', classes=np.unique(y_train_res), y=y_train_res)
+
+model = xgb.XGBClassifier(random_state=42, eval_metric='mlogloss')
+
+# Train the model
+print("Training XGBoost...")
+model.fit(X_train_scaled, y_train_res)
+
+# Predict probabilities instead of labels
+y_prob = model.predict_proba(X_test_scaled)
+
+# Get the top-2 predicted categories for each sample
+top_2_predictions = np.argsort(y_prob, axis=1)[:, -2:]
+
+# Compare with the true labels
+top_2_correct = [
+    y_test[i] in top_2_predictions[i] for i in range(len(y_test))
+]
+
+# Calculate accuracy for top-2 predictions
+top_2_accuracy = np.mean(top_2_correct)
+
+# Classification Report for Top-1 Predictions
+y_pred = model.predict(X_test_scaled)
+report = classification_report(y_test, y_pred)
+
+# Print results
+print(f"XGBoost Top-1 Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+print(f"XGBoost Top-2 Accuracy: {top_2_accuracy:.4f}")
+print(f"XGBoost Classification Report:\n{report}")
+print('-' * 50)
+
+def parse_date(date_str):
+    # ... (same as before)
+    for fmt in ('%m/%d/%Y %I:%M:%S %p', '%m-%d-%Y %H:%M'):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+def predict_top_2_crimes(model, scaler, label_encoder, user_date, user_latitude, user_longitude):
+    try:
+        parsed_date = parse_date(user_date)
+    except ValueError:
+        print("Invalid date format.")
+        return None
+
+    if parsed_date is None:
+        print("Invalid date format.")
+        return None
+
+    user_data = pd.DataFrame({
+        'DATE\xa0 OF OCCURRENCE': [user_date],
+        'LATITUDE': [user_latitude],
+        'LONGITUDE': [user_longitude],
+        'parsed_date': [parsed_date]
+    })
+
+    user_data['hour'] = user_data['parsed_date'].dt.hour
+    user_data['day'] = user_data['parsed_date'].dt.day
+    user_data['month'] = user_data['parsed_date'].dt.month
+    user_data['day_of_week'] = user_data['parsed_date'].dt.dayofweek
+    user_data['day_of_year'] = user_data['parsed_date'].dt.dayofyear
+
+    user_data = feature_engineering(user_data)
+
+    features = ['hour', 'day', 'month_sin', 'month_cos', 'day_of_week', 'LATITUDE', 'LONGITUDE', 'weekend',
+                'tod_morning','tod_afternoon','tod_evening', 'is_holiday', 'day_of_year',
+                'seas_spring', 'seas_summer', 'seas_winter', 'distance_to_center', 'distance_to_oblock',
+                'distance_to_englewood', 'distance_to_west_garfield_park', 'distance_to_austin', 'distance_to_humboldt_park']
+    
+    for feature in features:
+        if feature not in user_data.columns:
+            #print(f"Feature {feature} is missing. Imputing with 0.")
+            user_data[feature] = 0
+    
+    interaction_features = []
+    features_to_iterate = features[:]
+    for feature1, feature2 in zip(features_to_iterate[:-1], features_to_iterate[1:]):
+        interaction_name = f"{feature1}_{feature2}"
+        interaction_features.append(interaction_name)
+        user_data[interaction_name] = user_data[feature1] * user_data[feature2]
+
+    # Handle missing columns gracefully (IMPUTATION)
+    for feature in features + interaction_features:
+        if feature not in user_data.columns:
+            user_data[feature] = 0
+
+    X = user_data[features + interaction_features].values
+    X_scaled = scaler.transform(X)
+
+    y_prob = model.predict_proba(X_scaled)
+    top_2_indices = np.argsort(y_prob, axis=1)[0, -2:][::-1]
+    top_2_crimes = label_encoder.inverse_transform(top_2_indices)
+    
+    return top_2_crimes
+
+user_date = input("Enter date (MM/DD/YYYY HH:MM:SS AM/PM or MM-DD-YYYY HH:MM): ")
+user_latitude = float(input("Enter latitude: "))
+user_longitude = float(input("Enter longitude: "))
+
+import folium
+
+# Chicago coordinates
+chicago_latitude = 41.8781
+chicago_longitude = -87.6298
+
+# Chicago coordinates
+chicago_latitude = 41.8781
+chicago_longitude = -87.6298
+
+# Create a map centered on Chicago
+mymap = folium.Map(location=[chicago_latitude, chicago_longitude], zoom_start=12)
+
+# Add a marker for the user input location
+folium.Marker(
+    location=[user_latitude, user_longitude],
+    popup=f"Location: {user_latitude}, {user_longitude}\nDate: {user_date}"
+).add_to(mymap)
+
+# Display the map inline in Jupyter or a compatible environment
+display(mymap)
+
+
+top_2_predictions = predict_top_2_crimes(model, scaler, label_encoder, user_date, user_latitude, user_longitude)
+
+if top_2_predictions is not None:
+    print("Recommended Police Force:")
+    print(f"1. {top_2_predictions[0]}")
+    print(f"2. {top_2_predictions[1]}")
+
